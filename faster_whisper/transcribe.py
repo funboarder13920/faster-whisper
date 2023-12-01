@@ -9,7 +9,6 @@ from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
 import ctranslate2
 import numpy as np
 import tokenizers
-import torch
 
 from faster_whisper.audio import decode_audio
 from faster_whisper.feature_extractor import FeatureExtractor
@@ -167,7 +166,7 @@ class WhisperModel:
         language: Optional[str] = None,
         task: str = "transcribe",
         beam_size: int = 5,
-        batch_size: int = 2,
+        batch_size: int = 3,
         best_of: int = 5,
         patience: float = 1,
         length_penalty: float = 1,
@@ -299,7 +298,9 @@ class WhisperModel:
             speech_chunks = None
 
         features = self.feature_extractor(audio)
-        features, frame_offsets = split_audio(features, batch_size)
+        features, frame_offsets = split_audio(
+            features, batch_size, 2 * self.feature_extractor.nb_max_frames
+        )
         time_offsets = [
             frame_offset * self.feature_extractor.time_per_frame
             for frame_offset in frame_offsets
@@ -374,7 +375,12 @@ class WhisperModel:
         g_batch_segments = self.generate_segments(
             features, tokenizer, options, encoder_output
         )
-        segments = from_batch_to_single(g_batch_segments, time_offsets)
+        segments = from_batch_to_single(
+            g_batch_segments,
+            time_offsets,
+            self.feature_extractor.nb_max_frames
+            * self.feature_extractor.time_per_frame,
+        )
 
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
@@ -399,7 +405,7 @@ class WhisperModel:
         encoder_output: Optional[ctranslate2.StorageView] = None,
     ) -> Iterable[Iterable[Segment]]:
         g_batch_content_frames = (
-            np.count_nonzero(features[:, 0, :], axis=-1)
+            np.count_nonzero(features[:, 0, :] + 10000, axis=-1)
             - self.feature_extractor.nb_max_frames
         )
         batch_size = features.shape[0]
@@ -448,7 +454,10 @@ class WhisperModel:
 
             segment_size = min(
                 [
-                    min(self.feature_extractor.nb_max_frames, content_frames - seek)
+                    min(
+                        self.feature_extractor.nb_max_frames,
+                        content_frames - seek + self.feature_extractor.nb_max_frames,
+                    )
                     for seek, content_frames, is_done in zip(
                         g_batch_seek, g_batch_content_frames, g_batch_is_done
                     )
@@ -464,6 +473,7 @@ class WhisperModel:
                     if not is_done
                 ]
             )
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
                     "Processing segment at %s", format_timestamp(batch_time_offset)
@@ -608,7 +618,7 @@ class WhisperModel:
 
                         yield Segment(
                             id=g_idx[g_batch_index],
-                            seek=seek,
+                            seek=g_batch_seek[g_batch_index],
                             start=segment["start"],
                             end=segment["end"],
                             text=text,
@@ -691,25 +701,9 @@ class WhisperModel:
                     "patience": options.patience,
                 }
 
-            unfinished_encoder_output = encoder_output
-            unfinished_batch_prompt = batch_prompt
-            if len(convert_index) != encoder_output.shape[0]:
-                if torch_encoder_output is None:
-                    torch_encoder_output = torch.as_tensor(
-                        encoder_output, device=encoder_output.device
-                    ).contiguous()
-                if unfinished_memory[0] != tuple(convert_index):
-                    unfinished_memory = (
-                        tuple(convert_index),
-                        ctranslate2.StorageView.from_array(
-                            torch_encoder_output[convert_index]
-                        ),
-                    )
-                unfinished_encoder_output = unfinished_memory[1]
-                unfinished_batch_prompt = [batch_prompt[i] for i in convert_index]
             results = self.model.generate(
-                unfinished_encoder_output,
-                unfinished_batch_prompt,
+                encoder_output,
+                batch_prompt,
                 length_penalty=options.length_penalty,
                 repetition_penalty=options.repetition_penalty,
                 no_repeat_ngram_size=options.no_repeat_ngram_size,
@@ -721,6 +715,7 @@ class WhisperModel:
                 max_initial_timestamp_index=max_initial_timestamp_index,
                 **kwargs,
             )
+            results = [results[batch_index] for batch_index in convert_index]
             index_with_fallback = set()
 
             for batch_index, result in zip(convert_index, results):
@@ -1235,26 +1230,26 @@ def merge_punctuations(alignment: List[dict], prepended: str, appended: str) -> 
         j += 1
 
 
-def split_audio(features, batch_size):
-    remainder = features.shape[1] % batch_size
-    if remainder != 0:
-        remainder = batch_size - remainder
-    features = np.pad(features, ((0, 0), (0, remainder)))
-    offsets = [i * features.shape[-1] for i in range(features.shape[0])]
-    return (
-        np.swapaxes(
-            np.swapaxes(features, 0, 1).reshape(
-                (
-                    batch_size,
-                    math.ceil(features.shape[1] / batch_size),
-                    features.shape[0],
-                ),
-            ),
-            1,
-            2,
+def split_audio(features, batch_size, overlap):
+    split_features = -10000 * np.ones(
+        (
+            batch_size,
+            features.shape[0],
+            math.ceil(features.shape[1] / batch_size) + overlap,
         ),
-        offsets,
+        dtype=features.dtype,
     )
+    offsets = np.zeros(batch_size)
+    for i in range(batch_size):
+        start = i * math.ceil(features.shape[1] / batch_size)
+        end = min(
+            (i + 1) * math.ceil(features.shape[1] / batch_size) + overlap,
+            features.shape[1],
+        )
+        split_features[i, :, : end - start] = features[:, start:end]
+        offsets[i] = start
+
+    return split_features, offsets
 
 
 def ends_with_single_timestamp(tokens, timestamp_begin):
@@ -1274,30 +1269,137 @@ def index_of_consecutive_timestamps(tokens, timestamp_begin):
 
 
 def from_batch_to_single(
-    g_batch_segments: List[Iterable[Segment]], offsets: List[float]
+    g_batch_segments: List[Iterable[Segment]], offsets: List[float], delay: float
 ) -> Iterable[Segment]:
+    idx = 0
+    retained_last_segment = None
+    merge_batches = False
     for batch_index, segments in enumerate(g_batch_segments):
-        for segment in segments:
-            if segment.words:
-                words = []
-                for word in segment.words:
-                    # Ensure the word start and end times are resolved to the same chunk.
-                    word = word._replace(
-                        start=word.start + offsets[batch_index],
-                        end=word.end + offsets[batch_index],
-                    )
-                    words.append(word)
+        for segment_index, segment in enumerate(segments):
+            segment = offset_segment(segment, offsets[batch_index], idx)
+            if merge_batches:
+                if (
+                    retained_last_segment and retained_last_segment.end >= segment.end
+                ) or (
+                    delay >= segment.end
+                ):  # delay or last segment timestamp ?
+                    continue
+                merge_batches = False
+                if retained_last_segment:
+                    segment = merge_segments(retained_last_segment, segment)
 
-                segment = segment._replace(
-                    start=words[0].start,
-                    end=words[-1].end,
-                    words=words,
-                )
-
+            if batch_index == len(g_batch_segments) - 1:
+                idx += 1
+                yield segment
             else:
-                segment = segment._replace(
-                    start=segment.start + offsets[batch_index],
-                    end=segment.end + offsets[batch_index],
-                )
+                if segment.end >= offsets[batch_index + 1] + delay:
+                    retained_last_segment = segment
+                    break
+                else:
+                    idx += 1
+                    yield segment
+        merge_batches = True
 
-            yield segment
+
+def offset_segment(segment, offset, idx):
+    if segment.words:
+        words = []
+        for word in segment.words:
+            # Ensure the word start and end times are resolved to the same chunk.
+            word = word._replace(
+                start=word.start + offset,
+                end=word.end + offset,
+            )
+            words.append(word)
+
+        segment = segment._replace(
+            start=words[0].start,
+            end=words[-1].end,
+            words=words,
+            seek=segment.seek + offset,
+            id=idx,
+        )
+
+    else:
+        segment = segment._replace(
+            start=segment.start + offset,
+            end=segment.end + offset,
+            seek=segment.seek + offset,
+            id=idx,
+        )
+    return segment
+
+
+def merge_segments(start_segment, end_segment):
+    if start_segment.end <= end_segment.start:
+        # append two segments
+        return append_segments(start_segment, end_segment)
+    else:
+        if start_segment.words:
+            look_for_index = int(len(start_segment.words) / 2)
+            words = start_segment.words[: look_for_index - 1]
+            is_done = False
+            while (not is_done) and look_for_index < len(start_segment.words):
+                words.append(start_segment.words[look_for_index])
+                for index, word_end in enumerate(end_segment.words):
+                    if (
+                        word_end.word == start_segment.words[look_for_index].word
+                        and abs(
+                            word_end.start - start_segment.words[look_for_index].start
+                        )
+                        < 1
+                        and word_end.end > start_segment.words[look_for_index].start
+                    ):
+                        is_done = True
+                        words += end_segment.words[index + 1 :]
+                        break
+                look_for_index += 1
+            merged_text = "".join([word.word for word in words])
+            start_segment = start_segment._replace(words=words)
+        else:
+            merged_text = ""
+            middle_start = (start_segment.end + start_segment.start) / 2
+            pos_of_middle_in_end = int(
+                len(end_segment.text)
+                * (middle_start - end_segment.start)
+                / (end_segment.end - end_segment.start)
+            )
+            look_in_start = start_segment.text[
+                max(int(len(start_segment.text) / 2) - 30, 0) : int(
+                    len(start_segment.text) / 2
+                )
+                + 30
+            ]
+            look_in_end = end_segment.text[
+                max(pos_of_middle_in_end - 30, 0) : pos_of_middle_in_end + 30
+            ]
+            look_in_end_split = look_in_end.split()
+            for word in look_in_end_split[1:-1]:
+                if len(word) > 4 and word in look_in_start:
+                    look_in_start_index = look_in_start.find(word) + max(
+                        int(len(start_segment.text) / 2) - 30, 0
+                    )
+                    look_in_end_index = max(
+                        pos_of_middle_in_end - 30, 0
+                    ) + look_in_end.find(word)
+                    break
+            merged_text = (
+                start_segment.text[:look_in_start_index]
+                + end_segment.text[look_in_end_index:]
+            )
+
+        start_segment = start_segment._replace(
+            text=merged_text,
+            end=end_segment.end,
+        )
+    return start_segment
+
+
+def append_segments(segment_1, segment_2):
+    segment_1 = segment_1._replace(
+        text=segment_1.text + segment_2.text,
+        end=segment_2.end,
+    )
+    if segment_1.words:
+        segment_1 = segment_1._replace(words=segment_1.words + segment_2.words)
+    return segment_1
