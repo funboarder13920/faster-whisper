@@ -432,7 +432,6 @@ class WhisperModel:
         g_batch_seek = [0 for _ in range(batch_size)]
         g_batch_previous_seek = [0 for _ in range(batch_size)]
         g_all_tokens = [[] for _ in range(batch_size)]
-        g_batch_segments = [[] for _ in range(batch_size)]
         g_prompt_reset_since = [0 for _ in range(batch_size)]
         g_batch_is_done = [False for _ in range(batch_size)]
 
@@ -562,6 +561,7 @@ class WhisperModel:
                     tokenizer.timestamp_begin,
                     segment_size,
                     batch_time_offset[batch_index],
+                    result.no_speech_prob,
                 )
                 g_batch_seek[global_batch_index] = seek
                 batch_current_segments[batch_index] = current_segments
@@ -569,16 +569,12 @@ class WhisperModel:
             if len(g_batch_index_conversion) == len(skipped_batch_index):
                 continue
 
-            partial_encoder_output = encoder_output
-            partial_batch_current_segments = batch_current_segments
-            partial_batch_time_offset = batch_time_offset
-
             if options.word_timestamps:
                 self.add_word_timestamps(
-                    partial_batch_current_segments,
+                    batch_current_segments,
                     tokenizer,
-                    partial_encoder_output,
-                    partial_batch_time_offset,
+                    encoder_output,
+                    batch_time_offset,
                     segment_size,
                     options.prepend_punctuations,
                     options.append_punctuations,
@@ -587,7 +583,7 @@ class WhisperModel:
                 )
 
                 for partial_batch_index, current_segments in enumerate(
-                    partial_batch_current_segments
+                    batch_current_segments
                 ):
                     if partial_batch_index in skipped_batch_index:
                         continue
@@ -619,23 +615,26 @@ class WhisperModel:
                             )
 
             for partial_batch_index, current_segments in enumerate(
-                partial_batch_current_segments
+                batch_current_segments
             ):
                 if partial_batch_index in skipped_batch_index:
                     continue
+                g_batch_index = g_batch_index_conversion[partial_batch_index]
+                for segment in current_segments:
+                    tokens = segment["tokens"]
+                    text = tokenizer.decode(tokens)
 
-                def segment_iterator(current_segments, g_batch_index):
-                    for segment in current_segments:
-                        tokens = segment["tokens"]
-                        text = tokenizer.decode(tokens)
+                    if segment["start"] == segment["end"] or not text.strip():
+                        continue
 
-                        if segment["start"] == segment["end"] or not text.strip():
-                            continue
+                    g_all_tokens[g_batch_index].extend(
+                        [tok for tok in tokens if tok < tokenizer.sot]
+                    )
+                    g_idx[g_batch_index] += 1
 
-                        g_all_tokens[g_batch_index].extend(tokens)
-                        g_idx[g_batch_index] += 1
-
-                        yield Segment(
+                    yield (
+                        g_batch_index,
+                        Segment(
                             id=g_idx[g_batch_index],
                             seek=g_batch_seek[g_batch_index],
                             start=segment["start"],
@@ -645,20 +644,14 @@ class WhisperModel:
                             temperature=temperature,
                             avg_logprob=avg_logprob,
                             compression_ratio=compression_ratio,
-                            no_speech_prob=result.no_speech_prob,
+                            no_speech_prob=segment["no_speech_prob"],
                             words=(
                                 [Word(**word) for word in segment["words"]]
                                 if options.word_timestamps
                                 else None
                             ),
-                        )
-
-                g_batch_segments[g_batch_index_conversion[partial_batch_index]].append(
-                    segment_iterator(
-                        current_segments,
-                        g_batch_index_conversion[partial_batch_index],
+                        ),
                     )
-                )
 
                 if (
                     not options.condition_on_previous_text
@@ -674,9 +667,6 @@ class WhisperModel:
                     g_prompt_reset_since[
                         g_batch_index_conversion[partial_batch_index]
                     ] = len(g_all_tokens)
-        return [
-            itertools.chain.from_iterable(segments) for segments in g_batch_segments
-        ]
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -845,7 +835,7 @@ class WhisperModel:
 
     def add_word_timestamps(
         self,
-        g_batch_segments: List[List[dict]],
+        batch_current_segments: List[List[dict]],
         tokenizer: Tokenizer,
         encoder_output: ctranslate2.StorageView,
         batch_time_offset: List[int],
@@ -856,7 +846,8 @@ class WhisperModel:
         skipped_batch_index: set,
     ) -> None:
         if all(
-            (segments is None or len(segments) == 0) for segments in g_batch_segments
+            (segments is None or len(segments) == 0)
+            for segments in batch_current_segments
         ):
             return
 
@@ -867,7 +858,7 @@ class WhisperModel:
             ]
             if segments
             else []
-            for segments in g_batch_segments
+            for segments in batch_current_segments
         ]
 
         text_tokens = [
@@ -884,7 +875,7 @@ class WhisperModel:
             tokenizer, text_tokens, encoder_output, num_frames
         )
 
-        for batch_index, segments in enumerate(g_batch_segments):
+        for batch_index, segments in enumerate(batch_current_segments):
             if batch_index in skipped_batch_index:
                 continue
             word_durations = np.array(
@@ -1013,7 +1004,7 @@ class WhisperModel:
 
                     last_speech_timestamp[batch_index] = segment["end"]
 
-                g_batch_segments[batch_index][segment_index]["words"] = words
+                batch_current_segments[batch_index][segment_index]["words"] = words
 
     def find_alignment(
         self,
@@ -1079,7 +1070,7 @@ class WhisperModel:
         return batch_alignment
 
     def compute_current_segments_and_next_seek(
-        self, seek, tokens, timestamp_begin, segment_size, time_offset
+        self, seek, tokens, timestamp_begin, segment_size, time_offset, no_speech_prob
     ):
         current_segments = []
         segment_duration = segment_size * self.feature_extractor.time_per_frame
@@ -1111,6 +1102,7 @@ class WhisperModel:
                         start=start_time,
                         end=end_time,
                         tokens=sliced_tokens,
+                        no_speech_prob=no_speech_prob,
                     )
                 )
                 last_slice = current_slice
@@ -1139,6 +1131,7 @@ class WhisperModel:
                     start=time_offset,
                     end=time_offset + duration,
                     tokens=tokens,
+                    no_speech_prob=no_speech_prob,
                 )
             )
 
@@ -1293,31 +1286,9 @@ def from_batch_to_single(
     idx = 0
     retained_last_segment = None
     merge_batches = False
-    for batch_index, segments in enumerate(g_batch_segments):
-        for segment_index, segment in enumerate(segments):
-            segment = offset_segment(segment, offsets[batch_index], idx)
-            if merge_batches:
-                if (
-                    retained_last_segment and retained_last_segment.end >= segment.end
-                ) or (
-                    delay >= segment.end
-                ):  # delay or last segment timestamp ?
-                    continue
-                merge_batches = False
-                if retained_last_segment:
-                    segment = merge_segments(retained_last_segment, segment)
-
-            if batch_index == len(g_batch_segments) - 1:
-                idx += 1
-                yield segment
-            else:
-                if segment.end >= offsets[batch_index + 1] + delay:
-                    retained_last_segment = segment
-                    break
-                else:
-                    idx += 1
-                    yield segment
-        merge_batches = True
+    for batch_index, segment in g_batch_segments:
+        segment = offset_segment(segment, offsets[batch_index], idx)
+        yield segment
 
 
 def offset_segment(segment, offset, idx):
