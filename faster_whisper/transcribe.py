@@ -75,7 +75,7 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
-    prompt_reset_callback: Optional[Callable[[str], bool]]
+    prompt_reset_callback: Optional[Callable[[str, str], bool]]
 
 
 class TranscriptionInfo(NamedTuple):
@@ -223,7 +223,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
-        prompt_reset_callback: Optional[Callable[[str], bool]] = None,
+        prompt_reset_callback: Optional[Callable[[str, str], bool]] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -421,6 +421,7 @@ class WhisperModel:
         idx = 0
         seek = 0
         all_tokens = []
+        all_prompt_text = []
         prompt_reset_since = 0
 
         if options.initial_prompt is not None:
@@ -589,6 +590,7 @@ class WhisperModel:
                     if seek_shift > 0:
                         seek = previous_seek + seek_shift
 
+            current_tokens = []
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -596,8 +598,13 @@ class WhisperModel:
                 if segment["start"] == segment["end"] or not text.strip():
                     continue
 
-                all_tokens.extend(tokens)
-                idx += 1
+                if all(
+                    [text.strip() != i.strip() for i in all_prompt_text[-3:]]
+                ):
+                    all_tokens.extend(tokens)
+                    current_tokens += tokens
+                    all_prompt_text.append(text)
+                    idx += 1
 
                 yield Segment(
                     id=idx,
@@ -623,7 +630,8 @@ class WhisperModel:
                 or (
                     options.prompt_reset_callback
                     and options.prompt_reset_callback(
-                        tokenizer.decode(all_tokens[prompt_reset_since:])
+                        tokenizer.decode(all_tokens[prompt_reset_since:]),
+                        tokenizer.decode(current_tokens),
                     )
                 )
             ):
