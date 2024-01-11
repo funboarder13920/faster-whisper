@@ -591,6 +591,7 @@ class WhisperModel:
                         seek = previous_seek + seek_shift
 
             current_tokens = []
+            next_step_without_prompt = False
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -605,6 +606,8 @@ class WhisperModel:
                     current_tokens += tokens
                     all_prompt_text.append(text)
                     idx += 1
+                else:
+                    next_step_without_prompt = True
 
                 yield Segment(
                     id=idx,
@@ -627,6 +630,7 @@ class WhisperModel:
             if (
                 not options.condition_on_previous_text
                 or temperature > options.prompt_reset_on_temperature
+                or next_step_without_prompt
                 or (
                     options.prompt_reset_callback
                     and options.prompt_reset_callback(
