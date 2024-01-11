@@ -75,7 +75,7 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
-    prompt_reset_callback: Optional[Callable[str, bool]]
+    prompt_reset_callback: Optional[Callable[[str], bool]]
 
 
 class TranscriptionInfo(NamedTuple):
@@ -223,7 +223,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
-        prompt_reset_callback: Optional[Callable[str, bool]] = None,
+        prompt_reset_callback: Optional[Callable[[str], bool]] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
