@@ -390,6 +390,7 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            prompt_reset_callback=prompt_reset_callback,
         )
 
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
