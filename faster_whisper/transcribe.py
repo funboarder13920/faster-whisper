@@ -5,7 +5,16 @@ import os
 import zlib
 
 from inspect import signature
-from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    BinaryIO,
+    Callable,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import ctranslate2
 import numpy as np
@@ -66,6 +75,7 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
+    prompt_reset_callback: Optional[Callable[[str], bool]]
 
 
 class TranscriptionInfo(NamedTuple):
@@ -213,6 +223,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        prompt_reset_callback: Optional[Callable[[str], bool]] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -379,6 +390,7 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            prompt_reset_callback=prompt_reset_callback,
         )
 
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
@@ -608,6 +620,12 @@ class WhisperModel:
             if (
                 not options.condition_on_previous_text
                 or temperature > options.prompt_reset_on_temperature
+                or (
+                    options.prompt_reset_callback
+                    and options.prompt_reset_callback(
+                        tokenizer.decode(all_tokens[prompt_reset_since:])
+                    )
+                )
             ):
                 if options.condition_on_previous_text:
                     self.logger.debug(
