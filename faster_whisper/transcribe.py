@@ -567,11 +567,19 @@ class WhisperModel:
                 seek += segment_size
 
             if options.word_timestamps:
+                # add one second to the end of segment timestamp
+                nb_frames_of_interest = min(
+                    int(
+                        (seek - previous_seek)
+                        + 1 / self.feature_extractor.time_per_frame
+                    ),
+                    segment_size,
+                )
                 self.add_word_timestamps(
                     current_segments,
                     tokenizer,
                     encoder_output,
-                    segment_size,
+                    nb_frames_of_interest,
                     options.prepend_punctuations,
                     options.append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
@@ -600,7 +608,7 @@ class WhisperModel:
                     continue
 
                 if all(
-                    [text.strip() != i.strip() for i in all_prompt_text[-3:]]
+                    [text.strip() != i.strip() for i in all_prompt_text[-1:]]
                 ):
                     all_tokens.extend(tokens)
                     current_tokens += tokens
@@ -634,7 +642,11 @@ class WhisperModel:
                 or (
                     options.prompt_reset_callback
                     and options.prompt_reset_callback(
-                        tokenizer.decode(all_tokens[prompt_reset_since:]),
+                        tokenizer.decode(
+                            all_tokens[prompt_reset_since:][
+                                : -len(current_tokens)
+                            ]
+                        ),
                         tokenizer.decode(current_tokens),
                     )
                 )
