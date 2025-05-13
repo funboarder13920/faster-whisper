@@ -22,6 +22,12 @@ _MODELS = {
     "large-v2": "Systran/faster-whisper-large-v2",
     "large-v3": "Systran/faster-whisper-large-v3",
     "large": "Systran/faster-whisper-large-v3",
+    "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
+    "distil-medium.en": "Systran/faster-distil-whisper-medium.en",
+    "distil-small.en": "Systran/faster-distil-whisper-small.en",
+    "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
 
 
@@ -45,19 +51,23 @@ def download_model(
     output_dir: Optional[str] = None,
     local_files_only: bool = False,
     cache_dir: Optional[str] = None,
+    revision: Optional[str] = None,
 ):
     """Downloads a CTranslate2 Whisper model from the Hugging Face Hub.
 
     Args:
-      size_or_id: Size of the model to download from https://huggingface.co/guillaumekln
-        (tiny, tiny.en, base, base.en, small, small.en medium, medium.en, large-v1, large-v2,
-        large-v3, large), or a CTranslate2-converted model ID from the Hugging Face Hub
+      size_or_id: Size of the model to download from https://huggingface.co/Systran
+        (tiny, tiny.en, base, base.en, small, small.en, distil-small.en, medium, medium.en,
+        distil-medium.en, large-v1, large-v2, large-v3, large, distil-large-v2,
+        distil-large-v3), or a CTranslate2-converted model ID from the Hugging Face Hub
         (e.g. Systran/faster-whisper-large-v3).
       output_dir: Directory where the model should be saved. If not set, the model is saved in
         the cache directory.
       local_files_only:  If True, avoid downloading the file and return the path to the local
         cached file if it exists.
       cache_dir: Path to the folder where cached files are stored.
+      revision: An optional Git revision id which can be a branch name, a tag, or a
+            commit hash.
 
     Returns:
       The path to the downloaded model.
@@ -87,6 +97,7 @@ def download_model(
         "local_files_only": local_files_only,
         "allow_patterns": allow_patterns,
         "tqdm_class": disabled_tqdm,
+        "revision": revision,
     }
 
     if output_dir is not None:
@@ -143,3 +154,10 @@ class disabled_tqdm(tqdm):
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)
+
+
+def get_end(segments: List[dict]) -> Optional[float]:
+    return next(
+        (w["end"] for s in reversed(segments) for w in reversed(s["words"])),
+        segments[-1]["end"] if segments else None,
+    )
