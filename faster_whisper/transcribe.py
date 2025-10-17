@@ -774,6 +774,7 @@ class WhisperModel:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        prompt_reset_callback: Optional[Callable[[str, str], bool]] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -986,6 +987,7 @@ class WhisperModel:
             clip_timestamps=clip_timestamps,
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
+            prompt_reset_callback=prompt_reset_callback,
         )
 
         segments = self.generate_segments(
@@ -1124,6 +1126,7 @@ class WhisperModel:
         clip_idx = 0
         seek = seek_clips[clip_idx][0]
         all_tokens = []
+        all_prompt_text = []
         prompt_reset_since = 0
 
         if options.initial_prompt is not None:
@@ -1262,11 +1265,19 @@ class WhisperModel:
             )
 
             if options.word_timestamps:
+                # add one second to the end of segment timestamp
+                nb_frames_of_interest = min(
+                    int(
+                        (seek - previous_seek)
+                        + 1 / self.feature_extractor.time_per_frame
+                    ),
+                    segment_size,
+                )
                 self.add_word_timestamps(
                     [current_segments],
                     tokenizer,
                     encoder_output,
-                    segment_size,
+                    nb_frames_of_interest,
                     options.prepend_punctuations,
                     options.append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
@@ -1327,6 +1338,9 @@ class WhisperModel:
                 last_word_end = get_end(current_segments)
                 if last_word_end is not None:
                     last_speech_timestamp = last_word_end
+
+            current_tokens = []
+            next_step_without_prompt = False
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -1334,8 +1348,15 @@ class WhisperModel:
                 if segment["start"] == segment["end"] or not text.strip():
                     continue
 
-                all_tokens.extend(tokens)
-                idx += 1
+                if all(
+                    [text.strip() != i.strip() for i in all_prompt_text[-1:]]
+                ):
+                    all_tokens.extend(tokens)
+                    current_tokens += tokens
+                    all_prompt_text.append(text)
+                    idx += 1
+                else:
+                    next_step_without_prompt = True
 
                 yield Segment(
                     id=idx,
@@ -1358,6 +1379,18 @@ class WhisperModel:
             if (
                 not options.condition_on_previous_text
                 or temperature > options.prompt_reset_on_temperature
+                or next_step_without_prompt
+                or (
+                    options.prompt_reset_callback
+                    and options.prompt_reset_callback(
+                        tokenizer.decode(
+                            all_tokens[prompt_reset_since:][
+                                : -len(current_tokens)
+                            ]
+                        ),
+                        tokenizer.decode(current_tokens),
+                    )
+                )
             ):
                 if options.condition_on_previous_text:
                     self.logger.debug(
