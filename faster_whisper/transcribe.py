@@ -6,6 +6,16 @@ import zlib
 
 from dataclasses import asdict, dataclass
 from inspect import signature
+from typing import (
+    BinaryIO,
+    Callable,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 from math import ceil
 from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
 from warnings import warn
@@ -90,6 +100,7 @@ class TranscriptionOptions:
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
+    prompt_reset_callback: Optional[Callable[[str, str], bool]]
     multilingual: bool
     max_new_tokens: Optional[int]
     clip_timestamps: Union[str, List[float]]
@@ -767,6 +778,7 @@ class WhisperModel:
         multilingual: bool = False,
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        prompt_reset_callback: Optional[Callable[[str, str], bool]] = None,
         max_new_tokens: Optional[int] = None,
         chunk_length: Optional[int] = None,
         clip_timestamps: Union[str, List[float]] = "0",
@@ -981,6 +993,7 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            prompt_reset_callback=prompt_reset_callback,
             multilingual=multilingual,
             max_new_tokens=max_new_tokens,
             clip_timestamps=clip_timestamps,
@@ -1124,6 +1137,7 @@ class WhisperModel:
         clip_idx = 0
         seek = seek_clips[clip_idx][0]
         all_tokens = []
+        all_prompt_text = []
         prompt_reset_since = 0
 
         if options.initial_prompt is not None:
@@ -1262,15 +1276,24 @@ class WhisperModel:
             )
 
             if options.word_timestamps:
+                # add one second to the end of segment timestamp
+                nb_frames_of_interest = min(
+                    int(
+                        (seek - previous_seek)
+                        + 1 / self.feature_extractor.time_per_frame
+                    ),
+                    segment_size,
+                )
                 self.add_word_timestamps(
                     [current_segments],
                     tokenizer,
                     encoder_output,
-                    segment_size,
+                    nb_frames_of_interest,
                     options.prepend_punctuations,
                     options.append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
                 )
+
                 if not single_timestamp_ending:
                     last_word_end = get_end(current_segments)
                     if last_word_end is not None and last_word_end > time_offset:
@@ -1327,6 +1350,9 @@ class WhisperModel:
                 last_word_end = get_end(current_segments)
                 if last_word_end is not None:
                     last_speech_timestamp = last_word_end
+
+            current_tokens = []
+            next_step_without_prompt = False
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -1334,8 +1360,15 @@ class WhisperModel:
                 if segment["start"] == segment["end"] or not text.strip():
                     continue
 
-                all_tokens.extend(tokens)
-                idx += 1
+                if all(
+                    [text.strip() != i.strip() for i in all_prompt_text[-1:]]
+                ):
+                    all_tokens.extend(tokens)
+                    current_tokens += tokens
+                    all_prompt_text.append(text)
+                    idx += 1
+                else:
+                    next_step_without_prompt = True
 
                 yield Segment(
                     id=idx,
@@ -1358,6 +1391,18 @@ class WhisperModel:
             if (
                 not options.condition_on_previous_text
                 or temperature > options.prompt_reset_on_temperature
+                or next_step_without_prompt
+                or (
+                    options.prompt_reset_callback
+                    and options.prompt_reset_callback(
+                        tokenizer.decode(
+                            all_tokens[prompt_reset_since:][
+                                : -len(current_tokens)
+                            ]
+                        ),
+                        tokenizer.decode(current_tokens),
+                    )
+                )
             ):
                 if options.condition_on_previous_text:
                     self.logger.debug(
