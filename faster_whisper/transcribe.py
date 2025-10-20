@@ -95,6 +95,7 @@ class TranscriptionOptions:
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
+    prompt_reset_callback: Optional[Callable[[str, str], bool]]
 
 
 @dataclass
