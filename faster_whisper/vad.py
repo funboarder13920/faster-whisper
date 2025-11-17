@@ -89,9 +89,9 @@ def get_speech_timestamps(
     speech_probs = model(padded_audio)
 
     logger = get_logger()
-    deciles = np.percentile(speech_probs, np.arange(0, 110, 10))
+    deciles = np.percentile(speech_probs, np.arange(0, 101, 1))
     logger.info(
-        f"VAD speech probabilities deciles: {', '.join([f'{d:.3f}' for d in deciles])}"
+        f"VAD speech probabilities deciles: {', '.join([f'{d:.4f}' for d in deciles])}"
     )
 
     triggered = False
