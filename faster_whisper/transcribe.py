@@ -5,7 +5,16 @@ import os
 import zlib
 
 from inspect import signature
-from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    BinaryIO,
+    Callable,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import ctranslate2
 import numpy as np
@@ -66,6 +75,7 @@ class TranscriptionOptions(NamedTuple):
     word_timestamps: bool
     prepend_punctuations: str
     append_punctuations: str
+    prompt_reset_callback: Optional[Callable[[str, str], bool]]
 
 
 class TranscriptionInfo(NamedTuple):
@@ -213,6 +223,7 @@ class WhisperModel:
         append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
         vad_filter: bool = False,
         vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        prompt_reset_callback: Optional[Callable[[str, str], bool]] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -379,6 +390,7 @@ class WhisperModel:
             word_timestamps=word_timestamps,
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
+            prompt_reset_callback=prompt_reset_callback,
         )
 
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
@@ -409,6 +421,7 @@ class WhisperModel:
         idx = 0
         seek = 0
         all_tokens = []
+        all_prompt_text = []
         prompt_reset_since = 0
 
         if options.initial_prompt is not None:
@@ -554,11 +567,19 @@ class WhisperModel:
                 seek += segment_size
 
             if options.word_timestamps:
+                # add one second to the end of segment timestamp
+                nb_frames_of_interest = min(
+                    int(
+                        (seek - previous_seek)
+                        + 1 / self.feature_extractor.time_per_frame
+                    ),
+                    segment_size,
+                )
                 self.add_word_timestamps(
                     current_segments,
                     tokenizer,
                     encoder_output,
-                    segment_size,
+                    nb_frames_of_interest,
                     options.prepend_punctuations,
                     options.append_punctuations,
                     last_speech_timestamp=last_speech_timestamp,
@@ -577,6 +598,8 @@ class WhisperModel:
                     if seek_shift > 0:
                         seek = previous_seek + seek_shift
 
+            current_tokens = []
+            next_step_without_prompt = False
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -584,8 +607,15 @@ class WhisperModel:
                 if segment["start"] == segment["end"] or not text.strip():
                     continue
 
-                all_tokens.extend(tokens)
-                idx += 1
+                if all(
+                    [text.strip() != i.strip() for i in all_prompt_text[-1:]]
+                ):
+                    all_tokens.extend(tokens)
+                    current_tokens += tokens
+                    all_prompt_text.append(text)
+                    idx += 1
+                else:
+                    next_step_without_prompt = True
 
                 yield Segment(
                     id=idx,
@@ -608,6 +638,18 @@ class WhisperModel:
             if (
                 not options.condition_on_previous_text
                 or temperature > options.prompt_reset_on_temperature
+                or next_step_without_prompt
+                or (
+                    options.prompt_reset_callback
+                    and options.prompt_reset_callback(
+                        tokenizer.decode(
+                            all_tokens[prompt_reset_since:][
+                                : -len(current_tokens)
+                            ]
+                        ),
+                        tokenizer.decode(current_tokens),
+                    )
+                )
             ):
                 if options.condition_on_previous_text:
                     self.logger.debug(
