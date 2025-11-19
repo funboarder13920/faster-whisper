@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from faster_whisper.utils import get_assets_path
+from faster_whisper.utils import get_assets_path, get_logger
 
 
 # The code below is adapted from https://github.com/snakers4/silero-vad.
@@ -87,6 +87,12 @@ def get_speech_timestamps(
         audio, (0, window_size_samples - audio.shape[0] % window_size_samples)
     )
     speech_probs = model(padded_audio)
+
+    logger = get_logger()
+    deciles = np.percentile(speech_probs, np.arange(0, 101, 1))
+    logger.info(
+        f"VAD speech probabilities deciles: {', '.join([f'{d:.6f}' for d in deciles])}"
+    )
 
     triggered = False
     speeches = []
